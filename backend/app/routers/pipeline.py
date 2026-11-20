@@ -40,9 +40,14 @@ def trigger_metric_agg(
 
 @router.post("/forecast", response_model=ActionResult)
 def trigger_forecast(
-    horizon: int = Query(default=7, ge=1, le=30, description="预测天数"),
+    horizon: int = Query(default=0, ge=0, le=30, description="预测天数，0 表示沿用训练入口的周期（周报十天）"),
+    metric_code: str | None = Query(default=None, description="指标编号，缺省取训练入口默认指标"),
+    source_mode: str | None = Query(
+        default=None, description="来源模式：wide / switch / partition"),
 ) -> ActionResult:
-    result = run_forecast_pipeline(horizon)
+    result = run_forecast_pipeline(horizon, metric_code=metric_code, source_mode=source_mode)
+    if "error" in result:
+        return ActionResult(ok=False, message=str(result["error"]), entry=result)
     return ActionResult(ok=True, message="预测管道已执行", entry=result)
 
 

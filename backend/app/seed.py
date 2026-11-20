@@ -223,3 +223,118 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
          "时区设置": "Asia/Shanghai", "失败通知": "企业微信", "并发上限": "2", "依赖检查": "否", "下次执行": "2026-08-31 00:00"},
     ],
 }
+
+# ---------------------------------------------------------------------------
+# 迁移期辅助表：预测训练入口与迁移批次登记
+# ---------------------------------------------------------------------------
+# 训练入口只声明「用哪个指标、哪段窗口、哪种来源模式」；实际观测范围由分区存储
+# 的可用日期决定，截止日和逐日来源会写进每一次报表产物，切换存储后仍可复查。
+# 周报要求十天预测，但迁移后只有 08-25 至 08-30 六个分区可用，
+# 因此训练窗口覆盖 08-21 至 08-30，前四天在切换期按日回退宽表。
+SEED_ROWS["_forecast_training_entries"] = [
+    {
+        "id": 1,
+        "训练编号": "TFIT-GMV-10D",
+        "预测指标": "METR-GMV",
+        "预测算法": "线性趋势",
+        "训练窗口起": "2026-08-21",
+        "训练窗口止": "2026-08-30",
+        "预测周期": "10天",
+        "来源模式": "切换期",
+        "默认报表编号": "REPO-WEEKLY-FORECAST",
+        "说明": "周报十日预测：前四天只有宽表可读，末六天读新分区",
+    },
+    {
+        "id": 2,
+        "训练编号": "TFIT-CVR-10D",
+        "预测指标": "METR-CVR",
+        "预测算法": "线性趋势",
+        "训练窗口起": "2026-08-21",
+        "训练窗口止": "2026-08-30",
+        "预测周期": "10天",
+        "来源模式": "切换期",
+        "默认报表编号": "REPO-WEEKLY-CVR",
+        "说明": "转化率十日预测：分子分母始终取同一来源版本",
+    },
+]
+
+# 迁移流水线登记的回填批次。末六天 × 3 指标共 18 条已全部写完，但批次状态还停在
+# 「中断」：部署中断发生在数据落盘之后、批次状态回写之前。再次提交同一批次
+# 应识别出 18 条已存在并全部跳过，补齐批次状态且不产生第二条有效观测。
+SEED_ROWS["_series_batches"] = [
+    {
+        "批次号": "MIG-20260830-01",
+        "状态": "中断",
+        "回填日期": ["2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-29", "2026-08-30"],
+        "指标列表": ["METR-GMV", "METR-UV", "METR-CVR"],
+        "来源类型": "宽表存量",
+        "来源数据集": "trend_wide_daily",
+        "目标数据集": "trend_series_partitioned",
+        "总任务数": 18,
+        "已写入数": 18,
+        "跳过数": 0,
+        "断点": 18,
+        "尝试次数": 1,
+        "中断原因": "模拟部署中断：18 条分区观测已全部落盘，批次状态回写前进程退出",
+        "创建时间": "2026-08-30T22:10:00",
+        "更新时间": "2026-08-30T22:12:00",
+        "完成时间": None,
+    },
+]
+
+
+def _build_partition_rows() -> list[dict[str, Any]]:
+    """按迁移流水线的口径构造初始分区：末六天 × 三个指标，外加 08-28 的销售更正。
+
+    这里刻意复用分区模型里的口径函数，而不是手写观测值，
+    保证种子数据与运行时回填、更正走的是同一套取值和精度规则。
+    """
+    from app.services import partition_model as model
+
+    days = ["2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-29", "2026-08-30"]
+    rows: list[dict[str, Any]] = []
+    row_id = 0
+    for day in days:
+        wide = model.wide_row(day)
+        for metric_code in model.METRIC_ORDER:
+            row_id += 1
+            rows.append(model.make_observation(
+                metric_code,
+                day,
+                model.raw_from_wide(metric_code, wide),
+                source_type="宽表存量",
+                source_version=model.wide_version(day),
+                source_dataset=model.WIDE_TABLE_NAME,
+                batch="MIG-20260830-01",
+                version=1,
+                row_id=row_id,
+                note="迁移流水线从宽表回填",
+                created_at="2026-08-30T22:10:00",
+            ))
+
+    # 更正发生在回填之后：旧观测转为已替代，新观测成为 08-28 唯一有效值。
+    original = next(
+        row for row in rows
+        if row["指标编号"] == "METR-GMV" and row["日期"] == "2026-08-28")
+    row_id += 1
+    corrected = model.make_observation(
+        "METR-GMV",
+        "2026-08-28",
+        model.raw_from_value("METR-GMV", 242000),
+        source_type="销售更正",
+        source_version="sales_correction@2026-08-28",
+        source_dataset="sales_correction",
+        batch="CORR-20260828-02",
+        version=2,
+        row_id=row_id,
+        note="销售侧把 08-28 GMV 从 232000 更正为 242000",
+        created_at="2026-08-31T09:20:00",
+    )
+    corrected["替代自"] = original["id"]
+    original["状态"] = "已替代"
+    original["替代为"] = corrected["id"]
+    rows.append(corrected)
+    return rows
+
+
+SEED_ROWS["_series_partitions"] = _build_partition_rows()

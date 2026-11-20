@@ -6,8 +6,7 @@
 from __future__ import annotations
 
 import math
-import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 
 from app.fixtures import (
@@ -122,42 +121,67 @@ def run_metric_agg_pipeline(metric_code: str | None = None) -> dict[str, Any]:
 # Pipeline 2: trend_series -> forecast -> report_gen
 # ---------------------------------------------------------------------------
 
-def run_forecast_pipeline(horizon: int = 7) -> dict[str, Any]:
-    """基于 fixtures 时序数据做线性趋势外推，生成预测结果供报表消费。"""
-    points = list(TREND_POINTS)
-    n = len(points)
-    if n < 2:
-        return {"error": " insufficient data"}
+def run_forecast_pipeline(
+    horizon: int = 0,
+    *,
+    metric_code: str | None = None,
+    source_mode: str | None = None,
+) -> dict[str, Any]:
+    """从迁移后的分区数据集取实际观测做趋势外推，生成带来源信息的报表产物。
 
-    # 简单线性回归：x = 0..n-1, y = gmv
-    xs = list(range(n))
-    ys = [p["gmv"] for p in points]
-    x_mean = statistics.mean(xs)
-    y_mean = statistics.mean(ys)
-    num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-    den = sum((x - x_mean) ** 2 for x in xs)
-    slope = num / den if den else 0.0
-    intercept = y_mean - slope * x_mean
+    观测范围由预测训练入口决定：切换期按日回退宽表，全量启用只认新分区。
+    ``horizon`` 传 0（默认）时沿用训练入口登记的预测周期，周报入口是十天。
+    """
+    from app.services import forecast_training
 
-    last_date = datetime.strptime(points[-1]["日期"], "%Y-%m-%d").date()
-    forecasts: list[dict] = []
-    for i in range(1, horizon + 1):
-        pred = slope * (n - 1 + i) + intercept
-        pred_date = last_date + timedelta(days=i)
-        forecasts.append({
-            "日期": pred_date.isoformat(),
-            "预测gmv": round(pred, 2),
-            "置信下界": round(pred * 0.92, 2),
-            "置信上界": round(pred * 1.08, 2),
+    entry: dict[str, Any] | None = None
+    try:
+        entry = forecast_training.find_training_entry(metric_code=metric_code)
+        default_code = str(entry.get("默认报表编号") or "")
+        same_metric = metric_code is not None and entry.get("预测指标") == metric_code
+        report = forecast_training.save_report(
+            # 呼叫人显式指定指标时才引用该入口的固定报表编号，
+            # 这样「周报」可以持续追加版本而不是被覆盖；
+            # 其余情况按指标自动编号，避免不同指标共用同一个报表名。
+            report_code=default_code if (same_metric and default_code) else None,
+            training_code=None if metric_code else str(entry.get("训练编号")),
+            metric_code=metric_code if metric_code else str(entry.get("预测指标")),
+            mode=source_mode,
+            horizon=horizon if horizon and horizon > 0 else None,
+        )
+    except (forecast_training.ForecastTrainingError, ValueError) as error:
+        result = {"error": str(error), "metric_code": metric_code or (entry or {}).get("预测指标")}
+        _write_result("forecast_report", {
+            "source_modules": ["trend_series", "forecast"],
+            "target_module": "report_gen",
+            "payload": result,
         })
-
+        return result
     result = {
-        "model": "linear_trend",
-        "horizon": horizon,
-        "slope": round(slope, 4),
-        "intercept": round(intercept, 2),
-        "last_actual": points[-1]["gmv"],
-        "forecasts": forecasts,
+        "model": report["算法标识"],
+        "metric_code": report["预测指标"],
+        "horizon": report["预测周期"],
+        "slope": report["模型参数"].get("slope"),
+        "intercept": report["模型参数"].get("intercept"),
+        "last_actual": report["训练明细"][-1]["观测值"],
+        "forecasts": [
+            {
+                "日期": row["日期"],
+                "预测gmv": row["预测值"],
+                "置信下界": row["置信下界"],
+                "置信上界": row["置信上界"],
+            }
+            for row in report["预测"]
+        ],
+        "report_id": report["id"],
+        "report_code": report["报表编号"],
+        "training_cutoff": report["训练截止日"],
+        "source_mode": report["来源模式"],
+        "source_mode_name": report["来源模式名称"],
+        "training_sources": report["训练来源"],
+        "training_actual_total": report["训练区间合计"],
+        "forecast_total": report["预测合计"],
+        "corrected_days": report["已校正日期"],
     }
 
     _write_result("forecast_report", {

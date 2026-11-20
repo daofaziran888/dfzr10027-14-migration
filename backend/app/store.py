@@ -30,7 +30,10 @@ class Store:
 
     def overview(self) -> dict[str, object]:
         modules: list[dict[str, object]] = []
+        # 下划线开头的是管道/迁移的内部表，不当作业务模块展示。
         for name in self.module_names():
+            if name.startswith("_"):
+                continue
             rows = self.rows(name)
             modules.append({
                 "name": name,
@@ -51,6 +54,10 @@ store = Store()
 
 
 def reset_store() -> None:
-    """重新初始化全局 store，用于测试隔离。"""
-    global store
-    store = Store()
+    """重新初始化全局 store，用于测试隔离。
+
+    这里刻意保留 store 对象本身，只替换内部表：各业务模块在导入时
+    ``from app.store import store`` 已经持有对象引用，重新绑定全局变量会让它们
+    继续读写旧数据，测试之间就失去隔离。
+    """
+    store._tables = Store()._tables
